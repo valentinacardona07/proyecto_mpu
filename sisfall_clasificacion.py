@@ -14,13 +14,15 @@ DATASET_PATH = r"SisFall_dataset"
 CLASES = {"F13": 0, "F14": 1, "F15": 2}
 NOMBRES_CLASES = ["F13 (adelante)", "F14 (atrás)", "F15 (lateral)"]
 
-# Factores de conversión según el README
-# ADXL345: ±16g, 13 bits
-ADXL_SCALE = (2 * 16) / (2 ** 13)
-# ITG3200: ±2000°/s, 16 bits
-ITG_SCALE  = (2 * 2000) / (2 ** 16)
-# MMA8451Q: ±8g, 14 bits
-MMA_SCALE  = (2 * 8) / (2 ** 14)
+# Factores de conversión para usar solo señales equivalentes al MPU6050
+
+# Acelerómetro ADXL345 del dataset SisFall: ±16g, 13 bits
+# Convierte ax1, ay1, az1 a unidades de g
+ACC_SCALE = (2 * 16) / (2 ** 13)
+
+# Giroscopio ITG3200 del dataset SisFall: ±2000°/s, 16 bits
+# Convierte gx, gy, gz a grados por segundo
+GYRO_SCALE = (2 * 2000) / (2 ** 16)
 
 
 # ── 1. Carga y conversión de datos ────────────────────────────────────────────
