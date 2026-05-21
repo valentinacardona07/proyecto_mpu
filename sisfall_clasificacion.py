@@ -217,9 +217,9 @@ def main():
     if X is None or len(X) == 0:
         return
 
-    # 2. División train/test (80/20, estratificada)
+    # 2. División train/test (70/30, estratificada)
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
+        X, y, test_size=0.3, random_state=42, stratify=y
     )
     print(f"\n  Train: {len(X_train)} muestras | Test: {len(X_test)} muestras")
 
