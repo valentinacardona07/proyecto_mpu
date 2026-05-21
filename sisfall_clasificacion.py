@@ -8,7 +8,7 @@ warnings.filterwarnings("ignore")
 # ── Configuración ──────────────────────────────────────────────────────────────
 
 # Cambia esta ruta a donde tienes el dataset SisFall en tu PC
-DATASET_PATH = r"C:\Users\vhale\Documents\embebidos\proyecto_mpu\SisFall_dataset"
+DATASET_PATH = r"SisFall_dataset"
 
 # Clases que vamos a clasificar
 CLASES = {"F13": 0, "F14": 1, "F15": 2}
@@ -26,36 +26,42 @@ MMA_SCALE  = (2 * 8) / (2 ** 14)
 # ── 1. Carga y conversión de datos ────────────────────────────────────────────
 
 def leer_archivo(filepath):
-    """Lee un archivo .txt del SisFall y retorna un DataFrame con 9 columnas."""
+    """Lee un archivo .txt del SisFall y retorna un DataFrame con 6 columnas."""
     filas = []
+
     with open(filepath, "r") as f:
         for linea in f:
             linea = linea.strip().rstrip(";")
+
             if not linea:
                 continue
+
             try:
                 valores = [int(v.strip()) for v in linea.split(",")]
+
+                # SisFall tiene 9 columnas, pero solo usamos las primeras 6:
+                # ax1, ay1, az1, gx, gy, gz
                 if len(valores) == 9:
-                    filas.append(valores)
+                    filas.append(valores[:6])
+
             except ValueError:
                 continue
 
     if not filas:
         return None
 
-    columnas = ["ax1", "ay1", "az1", "gx", "gy", "gz", "ax2", "ay2", "az2"]
+    columnas = ["ax1", "ay1", "az1", "gx", "gy", "gz"]
     df = pd.DataFrame(filas, columns=columnas)
 
-    # Convertir a unidades físicas
+    # Convertir acelerómetro ADXL345 a g
     df["ax1"] *= ADXL_SCALE
     df["ay1"] *= ADXL_SCALE
     df["az1"] *= ADXL_SCALE
-    df["gx"]  *= ITG_SCALE
-    df["gy"]  *= ITG_SCALE
-    df["gz"]  *= ITG_SCALE
-    df["ax2"] *= MMA_SCALE
-    df["ay2"] *= MMA_SCALE
-    df["az2"] *= MMA_SCALE
+
+    # Convertir giroscopio ITG3200 a °/s
+    df["gx"] *= ITG_SCALE
+    df["gy"] *= ITG_SCALE
+    df["gz"] *= ITG_SCALE
 
     return df
 
