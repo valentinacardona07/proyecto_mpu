@@ -56,14 +56,14 @@ def leer_archivo(filepath):
     df = pd.DataFrame(filas, columns=columnas)
 
     # Convertir acelerómetro ADXL345 a g
-    df["ax1"] *= ADXL_SCALE
-    df["ay1"] *= ADXL_SCALE
-    df["az1"] *= ADXL_SCALE
+    df["ax1"] *= ACC_SCALE
+    df["ay1"] *= ACC_SCALE
+    df["az1"] *= ACC_SCALE
 
     # Convertir giroscopio ITG3200 a °/s
-    df["gx"] *= ITG_SCALE
-    df["gy"] *= ITG_SCALE
-    df["gz"] *= ITG_SCALE
+    df["gx"] *= GYRO_SCALE
+    df["gy"] *= GYRO_SCALE
+    df["gz"] *= GYRO_SCALE
 
     return df
 
