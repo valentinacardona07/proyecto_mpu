@@ -1,256 +1,140 @@
-import os
-import glob
-import warnings
-import joblib
+import os, glob, warnings, joblib
 import numpy as np
 import pandas as pd
 
 warnings.filterwarnings("ignore")
 
-DATASET_PATH = r"SisFall_dataset"
+DATASET_PATH = "SisFall_dataset"
+MODEL_FILE = "modelos_sisfall_sentado.pkl"
 RANDOM_STATE = 42
-BALANCEAR_CLASES = True
+FS = 200
+WINDOW_SECONDS = 3
+WIN = int(FS * WINDOW_SECONDS)
 
-CLASES = {
-    "F13": 0,
-    "F14": 1,
-    "F15": 2,
-    "D07": 3,
-    "D08": 3,
-    "D09": 3,
-    "D10": 3,
-}
+CLASES = {"F13": 0, "F14": 1, "F15": 2, "D07": 3, "D08": 3, "D09": 3, "D10": 3}
+NOMBRES_CLASES = ["F13 (caída adelante)", "F14 (caída atrás)", "F15 (caída lateral)", "Sentado quieto"]
+SENTADO = {"D07", "D08", "D09", "D10"}
 
-NOMBRES_CLASES = [
-    "F13 (caída adelante)",
-    "F14 (caída atrás)",
-    "F15 (caída lateral)",
-    "Sentado quieto"
-]
-
-CODIGOS_SENTADO = {"D07", "D08", "D09", "D10"}
-
-ACC_SCALE = (2 * 16) / (2 ** 13)
-GYRO_SCALE = (2 * 2000) / (2 ** 16)
+ACC_SCALE = 32 / (2 ** 13)
+GYRO_SCALE = 4000 / (2 ** 16)
 
 
-def leer_archivo(filepath):
+def leer_archivo(path):
     filas = []
-
-    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
         for linea in f:
-            linea = linea.strip().rstrip(";")
-            if not linea:
-                continue
-
             try:
-                valores = [int(v.strip()) for v in linea.split(",")]
-                if len(valores) == 9:
-                    filas.append(valores[:6])
+                v = [int(x.strip()) for x in linea.strip().rstrip(";").split(",")]
+                if len(v) == 9:
+                    filas.append(v[:6])
             except ValueError:
                 pass
 
     if not filas:
         return None
 
-    df = pd.DataFrame(filas, columns=["ax1", "ay1", "az1", "gx", "gy", "gz"])
-
-    df[["ax1", "ay1", "az1"]] *= ACC_SCALE
+    df = pd.DataFrame(filas, columns=["ax", "ay", "az", "gx", "gy", "gz"])
+    df[["ax", "ay", "az"]] *= ACC_SCALE
     df[["gx", "gy", "gz"]] *= GYRO_SCALE
-
     return df
 
 
-def obtener_sujeto(filepath):
-    nombre = os.path.splitext(os.path.basename(filepath))[0]
-
-    for parte in nombre.split("_"):
-        if parte.startswith(("SA", "SE")):
-            return parte
-
-    return os.path.basename(os.path.dirname(filepath))
+def sujeto(path):
+    name = os.path.splitext(os.path.basename(path))[0]
+    for p in name.split("_"):
+        if p.startswith(("SA", "SE")):
+            return p
+    return os.path.basename(os.path.dirname(path))
 
 
-def recortar_sentado(df, inicio=0.35, fin=0.65):
-    n = len(df)
-    i0 = int(inicio * n)
-    i1 = int(fin * n)
+def tomar_ventana(df, codigo):
+    if len(df) < WIN:
+        return None
 
-    if i1 - i0 < 50:
-        return df
+    if codigo in SENTADO:
+        centro = len(df) // 2
+    else:
+        acc = np.linalg.norm(df[["ax", "ay", "az"]].values, axis=1)
+        centro = int(np.argmax(acc))
 
-    return df.iloc[i0:i1].reset_index(drop=True)
-
-
-def extraer_caracteristicas(df):
-    caracteristicas = []
-
-    for col in df.columns:
-        s = df[col].values
-
-        caracteristicas += [
-            np.mean(s),
-            np.std(s),
-            np.min(s),
-            np.max(s),
-            np.max(s) - np.min(s),
-            np.mean(s ** 2),
-        ]
-
-    return caracteristicas
+    i0 = max(0, min(len(df) - WIN, centro - WIN // 2))
+    return df.iloc[i0:i0 + WIN].reset_index(drop=True)
 
 
-def balancear_dataset(X, y, grupos):
+def extraer_caracteristicas(data):
+    x = np.asarray(data, dtype=float)
+    acc_mag = np.linalg.norm(x[:, 0:3], axis=1)
+    gyro_mag = np.linalg.norm(x[:, 3:6], axis=1)
+    x = np.column_stack([x, acc_mag, gyro_mag])
+
+    feats = []
+    for s in x.T:
+        feats += [s.mean(), s.std(), s.min(), s.max(), s.max() - s.min(), np.sqrt(np.mean(s * s))]
+    return feats
+
+
+def balancear(X, y, g):
     rng = np.random.default_rng(RANDOM_STATE)
-    clases = np.unique(y)
-    min_muestras = min(np.sum(y == c) for c in clases)
+    n = min(np.sum(y == c) for c in np.unique(y))
+    idx = []
 
-    indices = []
+    for c in np.unique(y):
+        idx += list(rng.choice(np.where(y == c)[0], n, replace=False))
 
-    for c in clases:
-        idx = np.where(y == c)[0]
-        indices.extend(rng.choice(idx, min_muestras, replace=False))
-
-    indices = np.array(indices)
-    rng.shuffle(indices)
-
-    return X[indices], y[indices], grupos[indices]
+    idx = np.array(idx)
+    rng.shuffle(idx)
+    return X[idx], y[idx], g[idx]
 
 
-def cargar_dataset(path):
-    X, y, grupos = [], [], []
-    conteo_codigos = {k: 0 for k in CLASES}
+def cargar_dataset():
+    X, y, g = [], [], []
+    conteo = {k: 0 for k in CLASES}
 
-    archivos = glob.glob(os.path.join(path, "**", "*.txt"), recursive=True)
-
-    if not archivos:
-        print(f"\n[ERROR] No se encontraron archivos .txt en: {path}")
-        return None, None, None
-
-    for filepath in archivos:
-        codigo = os.path.basename(filepath)[:3]
-
+    for path in sorted(glob.glob(os.path.join(DATASET_PATH, "**", "*.txt"), recursive=True)):
+        codigo = os.path.basename(path)[:3]
         if codigo not in CLASES:
             continue
 
-        df = leer_archivo(filepath)
-
-        if df is None or len(df) < 50:
+        df = leer_archivo(path)
+        if df is None:
             continue
 
-        if codigo in CODIGOS_SENTADO:
-            df = recortar_sentado(df)
+        v = tomar_ventana(df, codigo)
+        if v is None:
+            continue
 
-        X.append(extraer_caracteristicas(df))
+        X.append(extraer_caracteristicas(v.values))
         y.append(CLASES[codigo])
-        grupos.append(obtener_sujeto(filepath))
-        conteo_codigos[codigo] += 1
+        g.append(sujeto(path))
+        conteo[codigo] += 1
 
-    X = np.array(X)
-    y = np.array(y)
-    grupos = np.array(grupos)
+    X, y, g = np.array(X), np.array(y), np.array(g)
 
-    print("\n── Archivos cargados por código ───────────────────")
-    for codigo, cantidad in conteo_codigos.items():
-        print(f"  {codigo}: {cantidad}")
+    print("\nArchivos cargados:")
+    for k, v in conteo.items():
+        print(f"{k}: {v}")
 
-    print("\n── Muestras por clase antes de balancear ──────────")
-    for i, nombre in enumerate(NOMBRES_CLASES):
-        print(f"  {nombre}: {np.sum(y == i)}")
+    print("\nMuestras antes de balancear:")
+    for i, n in enumerate(NOMBRES_CLASES):
+        print(f"{n}: {np.sum(y == i)}")
 
-    if BALANCEAR_CLASES:
-        X, y, grupos = balancear_dataset(X, y, grupos)
+    X, y, g = balancear(X, y, g)
 
-        print("\n── Muestras por clase después de balancear ────────")
-        for i, nombre in enumerate(NOMBRES_CLASES):
-            print(f"  {nombre}: {np.sum(y == i)}")
+    print("\nMuestras después de balancear:")
+    for i, n in enumerate(NOMBRES_CLASES):
+        print(f"{n}: {np.sum(y == i)}")
 
-    return X, y, grupos
+    return X, y, g
 
 
-def evaluar_modelo(nombre, y_test, y_pred):
+def evaluar(nombre, y_true, y_pred):
     from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
-    labels = list(range(len(NOMBRES_CLASES)))
-    acc = accuracy_score(y_test, y_pred)
-    cm = confusion_matrix(y_test, y_pred, labels=labels)
-
-    print(f"\n{'=' * 70}")
-    print(f"  {nombre}")
-    print(f"{'=' * 70}")
-    print(f"  Accuracy: {acc * 100:.2f}%")
-
-    aciertos = np.trace(cm)
-    total = np.sum(cm)
-
-    print(f"  Aciertos correctos: {aciertos}/{total}")
-    print(f"  Accuracy calculado desde matriz: {(aciertos / total) * 100:.2f}%\n")
-
-    print(classification_report(
-        y_test,
-        y_pred,
-        labels=labels,
-        target_names=NOMBRES_CLASES,
-        zero_division=0
-    ))
-
-    print("  Matriz de confusión:")
-    encabezado = " " * 26 + "".join([f"{n[:12]:>14}" for n in NOMBRES_CLASES])
-    print(encabezado)
-
-    for i, fila in enumerate(cm):
-        valores = "".join([f"{v:>14}" for v in fila])
-        print(f"  {NOMBRES_CLASES[i][:24]:24} {valores}")
-
-    return acc, cm
-
-
-def graficar_resultados(matrices, nombres, accuracies):
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle("Matrices de confusión — validación por sujeto", fontsize=13)
-
-    for ax, cm, nombre in zip(axes, matrices, nombres):
-        sns.heatmap(
-            cm,
-            annot=True,
-            fmt="d",
-            cmap="Blues",
-            ax=ax,
-            xticklabels=NOMBRES_CLASES,
-            yticklabels=NOMBRES_CLASES
-        )
-
-        ax.set_title(nombre)
-        ax.set_xlabel("Predicho")
-        ax.set_ylabel("Real")
-
-    plt.tight_layout()
-    plt.savefig("matrices_confusion.png", dpi=120, bbox_inches="tight")
-    plt.show()
-
-    fig, ax = plt.subplots(figsize=(8, 4))
-    barras = ax.bar(nombres, [a * 100 for a in accuracies], width=0.5)
-
-    for barra, acc in zip(barras, accuracies):
-        ax.text(
-            barra.get_x() + barra.get_width() / 2,
-            barra.get_height() + 0.5,
-            f"{acc * 100:.2f}%",
-            ha="center",
-            va="bottom"
-        )
-
-    ax.set_ylim(0, 110)
-    ax.set_ylabel("Accuracy (%)")
-    ax.set_title("Comparación de modelos — validación por sujeto")
-    ax.grid(axis="y", alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig("comparacion_modelos.png", dpi=120, bbox_inches="tight")
-    plt.show()
+    print(f"\n{'=' * 60}\n{nombre}\n{'=' * 60}")
+    print(f"Accuracy: {accuracy_score(y_true, y_pred) * 100:.2f}%")
+    print(classification_report(y_true, y_pred, target_names=NOMBRES_CLASES, zero_division=0))
+    print("Matriz de confusión:")
+    print(confusion_matrix(y_true, y_pred, labels=[0, 1, 2, 3]))
 
 
 def main():
@@ -260,129 +144,52 @@ def main():
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.neural_network import MLPClassifier
 
-    print("\n════════════════════════════════════════════════════════════════")
-    print("  Clasificación SisFall — validación por sujeto")
-    print("════════════════════════════════════════════════════════════════")
+    X, y, g = cargar_dataset()
 
-    X, y, grupos = cargar_dataset(DATASET_PATH)
+    split = GroupShuffleSplit(n_splits=1, test_size=0.30, random_state=RANDOM_STATE)
+    train_idx, test_idx = next(split.split(X, y, groups=g))
 
-    if X is None or len(X) == 0:
-        return
-
-    splitter = GroupShuffleSplit(
-        n_splits=1,
-        test_size=0.3,
-        random_state=RANDOM_STATE
-    )
-
-    train_idx, test_idx = next(splitter.split(X, y, groups=grupos))
-
-    X_train = X[train_idx]
-    X_test = X[test_idx]
-    y_train = y[train_idx]
-    y_test = y[test_idx]
-    grupos_train = grupos[train_idx]
-    grupos_test = grupos[test_idx]
-
-    sujetos_comunes = set(grupos_train) & set(grupos_test)
-
-    print("\n── División por sujeto ────────────────────────────")
-    print(f"  Sujetos en train: {len(set(grupos_train))}")
-    print(f"  Sujetos en test:  {len(set(grupos_test))}")
-    print(f"  Sujetos repetidos entre train y test: {len(sujetos_comunes)}")
-    print(f"  Muestras train: {len(X_train)}")
-    print(f"  Muestras test:  {len(X_test)}")
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
 
     scaler = StandardScaler()
     X_train_sc = scaler.fit_transform(X_train)
     X_test_sc = scaler.transform(X_test)
 
-    modelos = [
-        (
-            "Árbol de Decisión",
-            DecisionTreeClassifier(
-                max_depth=5,
-                min_samples_leaf=3,
-                class_weight="balanced",
-                random_state=RANDOM_STATE
-            ),
-            X_train,
-            X_test
+    modelos = {
+        "arbol_decision": DecisionTreeClassifier(
+            max_depth=8, min_samples_leaf=2, class_weight="balanced", random_state=RANDOM_STATE
         ),
-        (
-            "Random Forest",
-            RandomForestClassifier(
-                n_estimators=50,
-                max_depth=6,
-                min_samples_leaf=3,
-                class_weight="balanced",
-                random_state=RANDOM_STATE
-            ),
-            X_train,
-            X_test
+        "random_forest": RandomForestClassifier(
+            n_estimators=80, max_depth=10, min_samples_leaf=2,
+            class_weight="balanced", random_state=RANDOM_STATE, n_jobs=-1
         ),
-        (
-            "Red Neuronal MLP",
-            MLPClassifier(
-                hidden_layer_sizes=(64, 32),
-                activation="relu",
-                max_iter=300,
-                early_stopping=True,
-                validation_fraction=0.1,
-                random_state=RANDOM_STATE
-            ),
-            X_train_sc,
-            X_test_sc
+        "mlp": MLPClassifier(
+            hidden_layer_sizes=(32, 16), activation="relu", solver="lbfgs",
+            alpha=1e-3, max_iter=1000, random_state=RANDOM_STATE
         ),
-    ]
+    }
 
-    accuracies = []
-    matrices = []
-    nombres = []
-    modelos_entrenados = {}
+    modelos["arbol_decision"].fit(X_train, y_train)
+    modelos["random_forest"].fit(X_train, y_train)
+    modelos["mlp"].fit(X_train_sc, y_train)
 
-    for nombre, modelo, Xtr, Xte in modelos:
-        modelo.fit(Xtr, y_train)
-        y_pred = modelo.predict(Xte)
+    evaluar("Árbol de decisión", y_test, modelos["arbol_decision"].predict(X_test))
+    evaluar("Random Forest", y_test, modelos["random_forest"].predict(X_test))
+    evaluar("MLP", y_test, modelos["mlp"].predict(X_test_sc))
 
-        acc, cm = evaluar_modelo(nombre, y_test, y_pred)
+    joblib.dump({
+        "arbol_decision": modelos["arbol_decision"],
+        "random_forest": modelos["random_forest"],
+        "mlp": modelos["mlp"],
+        "scaler": scaler,
+        "nombres_clases": NOMBRES_CLASES,
+        "feature_count": X.shape[1],
+        "fs": FS,
+        "window_seconds": WINDOW_SECONDS,
+    }, MODEL_FILE)
 
-        accuracies.append(acc)
-        matrices.append(cm)
-        nombres.append(nombre)
-        modelos_entrenados[nombre] = modelo
-
-    mejor_idx = int(np.argmax(accuracies))
-
-    print("\n════════════════════════════════════════════════════════════════")
-    print("  Resumen final")
-    print("════════════════════════════════════════════════════════════════")
-
-    for nombre, acc in zip(nombres, accuracies):
-        print(f"  {nombre:<22} {acc * 100:6.2f}%")
-
-    print(f"\n  Mejor modelo: {nombres[mejor_idx]} ({accuracies[mejor_idx] * 100:.2f}%)")
-
-    joblib.dump(
-        {
-            "arbol_decision": modelos_entrenados["Árbol de Decisión"],
-            "random_forest": modelos_entrenados["Random Forest"],
-            "mlp": modelos_entrenados["Red Neuronal MLP"],
-            "scaler": scaler,
-            "nombres_clases": NOMBRES_CLASES,
-        },
-        "modelos_sisfall_sentado.pkl"
-    )
-
-    print("\n  Modelos guardados en: modelos_sisfall_sentado.pkl")
-
-    try:
-        graficar_resultados(matrices, nombres, accuracies)
-        print("  Figuras guardadas: matrices_confusion.png y comparacion_modelos.png")
-    except Exception as e:
-        print(f"\n  [Aviso] No se pudieron generar gráficas: {e}")
-
-    print("\n  ¡Listo!\n")
+    print(f"\nModelos guardados en: {MODEL_FILE}")
 
 
 if __name__ == "__main__":
