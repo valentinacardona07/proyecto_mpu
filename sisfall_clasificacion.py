@@ -1,299 +1,384 @@
 import os
 import glob
+import warnings
+import joblib
 import numpy as np
 import pandas as pd
-import warnings
+
 warnings.filterwarnings("ignore")
 
-# ── Configuración ──────────────────────────────────────────────────────────────
-
-# Cambia esta ruta a donde tienes el dataset SisFall en tu PC
 DATASET_PATH = r"SisFall_dataset"
+RANDOM_STATE = 42
+BALANCEAR_CLASES = True
 
-# Clases que vamos a clasificar
-CLASES = {"F13": 0, "F14": 1, "F15": 2}
-NOMBRES_CLASES = ["F13 (adelante)", "F14 (atrás)", "F15 (lateral)"]
+CLASES = {
+    "F13": 0,
+    "F14": 1,
+    "F15": 2,
+    "D07": 3,
+    "D08": 3,
+    "D09": 3,
+    "D10": 3,
+}
 
-# Factores de conversión para usar solo señales equivalentes al MPU6050
+NOMBRES_CLASES = [
+    "F13 (caída adelante)",
+    "F14 (caída atrás)",
+    "F15 (caída lateral)",
+    "Sentado quieto"
+]
 
-# Acelerómetro ADXL345 del dataset SisFall: ±16g, 13 bits
-# Convierte ax1, ay1, az1 a unidades de g
+CODIGOS_SENTADO = {"D07", "D08", "D09", "D10"}
+
 ACC_SCALE = (2 * 16) / (2 ** 13)
-
-# Giroscopio ITG3200 del dataset SisFall: ±2000°/s, 16 bits
-# Convierte gx, gy, gz a grados por segundo
 GYRO_SCALE = (2 * 2000) / (2 ** 16)
 
 
-# ── 1. Carga y conversión de datos ────────────────────────────────────────────
-
 def leer_archivo(filepath):
-    """Lee un archivo .txt del SisFall y retorna un DataFrame con 6 columnas."""
     filas = []
 
-    with open(filepath, "r") as f:
+    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
         for linea in f:
             linea = linea.strip().rstrip(";")
-
             if not linea:
                 continue
 
             try:
                 valores = [int(v.strip()) for v in linea.split(",")]
-
-                # SisFall tiene 9 columnas, pero solo usamos las primeras 6:
-                # ax1, ay1, az1, gx, gy, gz
                 if len(valores) == 9:
                     filas.append(valores[:6])
-
             except ValueError:
-                continue
+                pass
 
     if not filas:
         return None
 
-    columnas = ["ax1", "ay1", "az1", "gx", "gy", "gz"]
-    df = pd.DataFrame(filas, columns=columnas)
+    df = pd.DataFrame(filas, columns=["ax1", "ay1", "az1", "gx", "gy", "gz"])
 
-    # Convertir acelerómetro ADXL345 a g
-    df["ax1"] *= ACC_SCALE
-    df["ay1"] *= ACC_SCALE
-    df["az1"] *= ACC_SCALE
-
-    # Convertir giroscopio ITG3200 a °/s
-    df["gx"] *= GYRO_SCALE
-    df["gy"] *= GYRO_SCALE
-    df["gz"] *= GYRO_SCALE
+    df[["ax1", "ay1", "az1"]] *= ACC_SCALE
+    df[["gx", "gy", "gz"]] *= GYRO_SCALE
 
     return df
 
 
+def obtener_sujeto(filepath):
+    nombre = os.path.splitext(os.path.basename(filepath))[0]
+
+    for parte in nombre.split("_"):
+        if parte.startswith(("SA", "SE")):
+            return parte
+
+    return os.path.basename(os.path.dirname(filepath))
+
+
+def recortar_sentado(df, inicio=0.35, fin=0.65):
+    n = len(df)
+    i0 = int(inicio * n)
+    i1 = int(fin * n)
+
+    if i1 - i0 < 50:
+        return df
+
+    return df.iloc[i0:i1].reset_index(drop=True)
+
+
 def extraer_caracteristicas(df):
-    """
-    Extrae un vector de características estadísticas por señal.
-    Para cada columna calcula: media, std, min, max, rango, energía.
-    Total: 9 columnas × 6 estadísticos = 54 características.
-    """
     caracteristicas = []
+
     for col in df.columns:
-        serie = df[col].values
+        s = df[col].values
+
         caracteristicas += [
-            np.mean(serie),
-            np.std(serie),
-            np.min(serie),
-            np.max(serie),
-            np.max(serie) - np.min(serie),          # rango
-            np.mean(serie ** 2),                     # energía
+            np.mean(s),
+            np.std(s),
+            np.min(s),
+            np.max(s),
+            np.max(s) - np.min(s),
+            np.mean(s ** 2),
         ]
+
     return caracteristicas
 
 
-def cargar_dataset(path):
-    """Recorre todas las carpetas y carga los archivos F13, F14, F15."""
-    X, y = [], []
-    archivos_encontrados = {k: 0 for k in CLASES}
+def balancear_dataset(X, y, grupos):
+    rng = np.random.default_rng(RANDOM_STATE)
+    clases = np.unique(y)
+    min_muestras = min(np.sum(y == c) for c in clases)
 
-    patron = os.path.join(path, "**", "*.txt")
-    archivos = glob.glob(patron, recursive=True)
+    indices = []
+
+    for c in clases:
+        idx = np.where(y == c)[0]
+        indices.extend(rng.choice(idx, min_muestras, replace=False))
+
+    indices = np.array(indices)
+    rng.shuffle(indices)
+
+    return X[indices], y[indices], grupos[indices]
+
+
+def cargar_dataset(path):
+    X, y, grupos = [], [], []
+    conteo_codigos = {k: 0 for k in CLASES}
+
+    archivos = glob.glob(os.path.join(path, "**", "*.txt"), recursive=True)
 
     if not archivos:
         print(f"\n[ERROR] No se encontraron archivos .txt en: {path}")
-        print("Verifica que DATASET_PATH apunte a la carpeta raíz del SisFall.")
-        return None, None
+        return None, None, None
 
     for filepath in archivos:
-        nombre = os.path.basename(filepath)
-        codigo = nombre[:3]  # F13, F14, F15, D01, etc.
+        codigo = os.path.basename(filepath)[:3]
 
         if codigo not in CLASES:
             continue
 
         df = leer_archivo(filepath)
+
         if df is None or len(df) < 50:
             continue
 
-        feats = extraer_caracteristicas(df)
-        X.append(feats)
+        if codigo in CODIGOS_SENTADO:
+            df = recortar_sentado(df)
+
+        X.append(extraer_caracteristicas(df))
         y.append(CLASES[codigo])
-        archivos_encontrados[codigo] += 1
+        grupos.append(obtener_sujeto(filepath))
+        conteo_codigos[codigo] += 1
 
-    print("\n── Archivos cargados ──────────────────────────────")
-    for k, v in archivos_encontrados.items():
-        print(f"  {k}: {v} archivos")
-    print(f"  Total muestras: {len(X)}")
+    X = np.array(X)
+    y = np.array(y)
+    grupos = np.array(grupos)
 
-    return np.array(X), np.array(y)
+    print("\n── Archivos cargados por código ───────────────────")
+    for codigo, cantidad in conteo_codigos.items():
+        print(f"  {codigo}: {cantidad}")
 
+    print("\n── Muestras por clase antes de balancear ──────────")
+    for i, nombre in enumerate(NOMBRES_CLASES):
+        print(f"  {nombre}: {np.sum(y == i)}")
 
-# ── 2. Entrenamiento y evaluación ─────────────────────────────────────────────
+    if BALANCEAR_CLASES:
+        X, y, grupos = balancear_dataset(X, y, grupos)
+
+        print("\n── Muestras por clase después de balancear ────────")
+        for i, nombre in enumerate(NOMBRES_CLASES):
+            print(f"  {nombre}: {np.sum(y == i)}")
+
+    return X, y, grupos
+
 
 def evaluar_modelo(nombre, y_test, y_pred):
-    """Imprime métricas y matriz de confusión para un modelo."""
-    from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+    from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
+    labels = list(range(len(NOMBRES_CLASES)))
     acc = accuracy_score(y_test, y_pred)
-    print(f"\n{'='*52}")
-    print(f"  {nombre}")
-    print(f"{'='*52}")
-    print(f"  Accuracy: {acc:.4f} ({acc*100:.2f}%)\n")
-    print(classification_report(y_test, y_pred, target_names=NOMBRES_CLASES))
+    cm = confusion_matrix(y_test, y_pred, labels=labels)
 
-    cm = confusion_matrix(y_test, y_pred)
+    print(f"\n{'=' * 70}")
+    print(f"  {nombre}")
+    print(f"{'=' * 70}")
+    print(f"  Accuracy: {acc * 100:.2f}%")
+
+    aciertos = np.trace(cm)
+    total = np.sum(cm)
+
+    print(f"  Aciertos correctos: {aciertos}/{total}")
+    print(f"  Accuracy calculado desde matriz: {(aciertos / total) * 100:.2f}%\n")
+
+    print(classification_report(
+        y_test,
+        y_pred,
+        labels=labels,
+        target_names=NOMBRES_CLASES,
+        zero_division=0
+    ))
+
     print("  Matriz de confusión:")
-    print(f"  {'':18} {'F13':>6} {'F14':>6} {'F15':>6}")
+    encabezado = " " * 26 + "".join([f"{n[:12]:>14}" for n in NOMBRES_CLASES])
+    print(encabezado)
+
     for i, fila in enumerate(cm):
-        print(f"  {NOMBRES_CLASES[i]:18} {fila[0]:>6} {fila[1]:>6} {fila[2]:>6}")
+        valores = "".join([f"{v:>14}" for v in fila])
+        print(f"  {NOMBRES_CLASES[i][:24]:24} {valores}")
 
     return acc, cm
 
 
-def graficar_matrices(matrices, nombres):
-    """Genera una figura con las 3 matrices de confusión."""
+def graficar_resultados(matrices, nombres, accuracies):
     import matplotlib.pyplot as plt
     import seaborn as sns
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    fig.suptitle("Matrices de confusión — F13 vs F14 vs F15", fontsize=13)
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig.suptitle("Matrices de confusión — validación por sujeto", fontsize=13)
 
     for ax, cm, nombre in zip(axes, matrices, nombres):
         sns.heatmap(
-            cm, annot=True, fmt="d", cmap="Blues", ax=ax,
-            xticklabels=["F13", "F14", "F15"],
-            yticklabels=["F13", "F14", "F15"]
+            cm,
+            annot=True,
+            fmt="d",
+            cmap="Blues",
+            ax=ax,
+            xticklabels=NOMBRES_CLASES,
+            yticklabels=NOMBRES_CLASES
         )
-        ax.set_title(nombre, fontsize=11)
+
+        ax.set_title(nombre)
         ax.set_xlabel("Predicho")
         ax.set_ylabel("Real")
 
     plt.tight_layout()
     plt.savefig("matrices_confusion.png", dpi=120, bbox_inches="tight")
-    print("\n  Figura guardada: matrices_confusion.png")
     plt.show()
 
-
-def graficar_comparacion(nombres, accuracies):
-    """Gráfico de barras comparando accuracy de los 3 modelos."""
-    import matplotlib.pyplot as plt
-
-    colores = ["#4C72B0", "#55A868", "#C44E52"]
-    fig, ax = plt.subplots(figsize=(7, 4))
-    barras = ax.bar(nombres, [a * 100 for a in accuracies], color=colores, width=0.5)
+    fig, ax = plt.subplots(figsize=(8, 4))
+    barras = ax.bar(nombres, [a * 100 for a in accuracies], width=0.5)
 
     for barra, acc in zip(barras, accuracies):
         ax.text(
             barra.get_x() + barra.get_width() / 2,
             barra.get_height() + 0.5,
-            f"{acc*100:.2f}%",
-            ha="center", va="bottom", fontsize=11
+            f"{acc * 100:.2f}%",
+            ha="center",
+            va="bottom"
         )
 
     ax.set_ylim(0, 110)
     ax.set_ylabel("Accuracy (%)")
-    ax.set_title("Comparación de modelos — SisFall F13/F14/F15")
+    ax.set_title("Comparación de modelos — validación por sujeto")
     ax.grid(axis="y", alpha=0.3)
+
     plt.tight_layout()
     plt.savefig("comparacion_modelos.png", dpi=120, bbox_inches="tight")
-    print("  Figura guardada: comparacion_modelos.png")
     plt.show()
 
 
-# ── 3. Main ───────────────────────────────────────────────────────────────────
-
 def main():
-    from sklearn.model_selection import train_test_split
+    from sklearn.model_selection import GroupShuffleSplit
     from sklearn.preprocessing import StandardScaler
     from sklearn.tree import DecisionTreeClassifier
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.neural_network import MLPClassifier
 
-    print("\n══════════════════════════════════════════════════")
-    print("  Clasificación SisFall — F13 / F14 / F15")
-    print("══════════════════════════════════════════════════")
+    print("\n════════════════════════════════════════════════════════════════")
+    print("  Clasificación SisFall — validación por sujeto")
+    print("════════════════════════════════════════════════════════════════")
 
-    # 1. Cargar datos
-    print(f"\nBuscando datos en: {DATASET_PATH}")
-    X, y = cargar_dataset(DATASET_PATH)
+    X, y, grupos = cargar_dataset(DATASET_PATH)
 
     if X is None or len(X) == 0:
         return
 
-    # 2. División train/test (70/30, estratificada)
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.3, random_state=42, stratify=y
+    splitter = GroupShuffleSplit(
+        n_splits=1,
+        test_size=0.3,
+        random_state=RANDOM_STATE
     )
-    print(f"\n  Train: {len(X_train)} muestras | Test: {len(X_test)} muestras")
 
-    # 3. Normalización (necesaria para MLP)
+    train_idx, test_idx = next(splitter.split(X, y, groups=grupos))
+
+    X_train = X[train_idx]
+    X_test = X[test_idx]
+    y_train = y[train_idx]
+    y_test = y[test_idx]
+    grupos_train = grupos[train_idx]
+    grupos_test = grupos[test_idx]
+
+    sujetos_comunes = set(grupos_train) & set(grupos_test)
+
+    print("\n── División por sujeto ────────────────────────────")
+    print(f"  Sujetos en train: {len(set(grupos_train))}")
+    print(f"  Sujetos en test:  {len(set(grupos_test))}")
+    print(f"  Sujetos repetidos entre train y test: {len(sujetos_comunes)}")
+    print(f"  Muestras train: {len(X_train)}")
+    print(f"  Muestras test:  {len(X_test)}")
+
     scaler = StandardScaler()
     X_train_sc = scaler.fit_transform(X_train)
-    X_test_sc  = scaler.transform(X_test)
+    X_test_sc = scaler.transform(X_test)
+
+    modelos = [
+        (
+            "Árbol de Decisión",
+            DecisionTreeClassifier(
+                max_depth=5,
+                min_samples_leaf=3,
+                class_weight="balanced",
+                random_state=RANDOM_STATE
+            ),
+            X_train,
+            X_test
+        ),
+        (
+            "Random Forest",
+            RandomForestClassifier(
+                n_estimators=50,
+                max_depth=6,
+                min_samples_leaf=3,
+                class_weight="balanced",
+                random_state=RANDOM_STATE
+            ),
+            X_train,
+            X_test
+        ),
+        (
+            "Red Neuronal MLP",
+            MLPClassifier(
+                hidden_layer_sizes=(64, 32),
+                activation="relu",
+                max_iter=300,
+                early_stopping=True,
+                validation_fraction=0.1,
+                random_state=RANDOM_STATE
+            ),
+            X_train_sc,
+            X_test_sc
+        ),
+    ]
 
     accuracies = []
-    matrices   = []
-    nombres    = []
+    matrices = []
+    nombres = []
+    modelos_entrenados = {}
 
-    # ── Modelo 1: Árbol de Decisión ───────────────────────────────────────────
-    # max_depth=5 → árbol pequeño, sin sobreajuste
-    arbol = DecisionTreeClassifier(
-        max_depth=5,
-        min_samples_leaf=3,
-        random_state=42
-    )
-    arbol.fit(X_train, y_train)
-    y_pred_arbol = arbol.predict(X_test)
-    acc, cm = evaluar_modelo("Árbol de Decisión (max_depth=5)", y_test, y_pred_arbol)
-    accuracies.append(acc)
-    matrices.append(cm)
-    nombres.append("Árbol de Decisión")
+    for nombre, modelo, Xtr, Xte in modelos:
+        modelo.fit(Xtr, y_train)
+        y_pred = modelo.predict(Xte)
 
-    # ── Modelo 2: Random Forest ───────────────────────────────────────────────
-    # 50 árboles pequeños → buen balance precisión/tamaño
-    rf = RandomForestClassifier(
-        n_estimators=50,
-        max_depth=6,
-        min_samples_leaf=3,
-        random_state=42
-    )
-    rf.fit(X_train, y_train)
-    y_pred_rf = rf.predict(X_test)
-    acc, cm = evaluar_modelo("Random Forest (50 árboles, max_depth=6)", y_test, y_pred_rf)
-    accuracies.append(acc)
-    matrices.append(cm)
-    nombres.append("Random Forest")
+        acc, cm = evaluar_modelo(nombre, y_test, y_pred)
 
-    # ── Modelo 3: Red Neuronal (MLP) ──────────────────────────────────────────
-    # 2 capas ocultas pequeñas: (64, 32)
-    # max_iter=200 → entrena rápido
-    mlp = MLPClassifier(
-        hidden_layer_sizes=(64, 32),
-        activation="relu",
-        max_iter=200,
-        random_state=42,
-        early_stopping=True,
-        validation_fraction=0.1
-    )
-    mlp.fit(X_train_sc, y_train)
-    y_pred_mlp = mlp.predict(X_test_sc)
-    acc, cm = evaluar_modelo("Red Neuronal MLP (64→32)", y_test, y_pred_mlp)
-    accuracies.append(acc)
-    matrices.append(cm)
-    nombres.append("Red Neuronal MLP")
-
-    # ── Resumen final ─────────────────────────────────────────────────────────
-    print("\n══════════════════════════════════════════════════")
-    print("  Resumen final")
-    print("══════════════════════════════════════════════════")
-    for nombre, acc in zip(nombres, accuracies):
-        barra = "█" * int(acc * 30)
-        print(f"  {nombre:<25} {acc*100:6.2f}%  {barra}")
+        accuracies.append(acc)
+        matrices.append(cm)
+        nombres.append(nombre)
+        modelos_entrenados[nombre] = modelo
 
     mejor_idx = int(np.argmax(accuracies))
-    print(f"\n  Mejor modelo: {nombres[mejor_idx]} ({accuracies[mejor_idx]*100:.2f}%)")
 
-    # ── Gráficas ──────────────────────────────────────────────────────────────
+    print("\n════════════════════════════════════════════════════════════════")
+    print("  Resumen final")
+    print("════════════════════════════════════════════════════════════════")
+
+    for nombre, acc in zip(nombres, accuracies):
+        print(f"  {nombre:<22} {acc * 100:6.2f}%")
+
+    print(f"\n  Mejor modelo: {nombres[mejor_idx]} ({accuracies[mejor_idx] * 100:.2f}%)")
+
+    joblib.dump(
+        {
+            "arbol_decision": modelos_entrenados["Árbol de Decisión"],
+            "random_forest": modelos_entrenados["Random Forest"],
+            "mlp": modelos_entrenados["Red Neuronal MLP"],
+            "scaler": scaler,
+            "nombres_clases": NOMBRES_CLASES,
+        },
+        "modelos_sisfall_sentado.pkl"
+    )
+
+    print("\n  Modelos guardados en: modelos_sisfall_sentado.pkl")
+
     try:
-        graficar_matrices(matrices, nombres)
-        graficar_comparacion(nombres, accuracies)
+        graficar_resultados(matrices, nombres, accuracies)
+        print("  Figuras guardadas: matrices_confusion.png y comparacion_modelos.png")
     except Exception as e:
         print(f"\n  [Aviso] No se pudieron generar gráficas: {e}")
 
