@@ -1,118 +1,178 @@
 #!/usr/bin/env python3
-import time, joblib, argparse
+
+import argparse, time, joblib
 from collections import deque
 import numpy as np
 from smbus2 import SMBus
 
-I2C_BUS, MPU_ADDR = 1, 0x68
-FS, WINDOW_SECONDS, PREDICT_EVERY_SECONDS = 200.0, 3.0, 1
-ACC_LSB_PER_G, GYRO_LSB_PER_DPS = 2048.0, 16.4
+I2C_BUS = 1
+MPU_ADDR = 0x68
+MODEL_FILE = "modelos_sisfall_sentado.pkl"
 
-def to_int16(msb, lsb):
+FS = 200.0
+WINDOW_SECONDS = 3.0
+PREDICT_EVERY_SECONDS = 1.0
+
+ACC_LSB_PER_G = 2048.0
+GYRO_LSB_PER_DPS = 16.4
+
+REG_SMPLRT_DIV = 0x19
+REG_CONFIG = 0x1A
+REG_GYRO_CONFIG = 0x1B
+REG_ACCEL_CONFIG = 0x1C
+REG_ACCEL_XOUT_H = 0x3B
+REG_PWR_MGMT_1 = 0x6B
+REG_WHO_AM_I = 0x75
+
+
+def int16(msb, lsb):
     v = (msb << 8) | lsb
     return v - 65536 if v >= 32768 else v
 
+
 def init_mpu(bus):
-    try:
-        bus.write_byte_data(MPU_ADDR, 0x6B, 0x00) # Despertar sensor
-        time.sleep(0.1)
-        bus.write_byte_data(MPU_ADDR, 0x1A, 0x03) # DLPF habilitado
-        bus.write_byte_data(MPU_ADDR, 0x19, 4)    # Frecuencia interna a 200 Hz
-        bus.write_byte_data(MPU_ADDR, 0x1B, 0x18) # Gyro ±2000 °/s
-        bus.write_byte_data(MPU_ADDR, 0x1C, 0x18) # Accel ±16 g
-        time.sleep(0.1)
-    except OSError:
-        print("[ERROR] No se pudo inicializar el MPU6050. Verifica las conexiones físicas I2C.")
+    print(f"[INFO] WHO_AM_I = 0x{bus.read_byte_data(MPU_ADDR, REG_WHO_AM_I):02X}")
+    bus.write_byte_data(MPU_ADDR, REG_PWR_MGMT_1, 0x00)
+    time.sleep(0.1)
+    bus.write_byte_data(MPU_ADDR, REG_CONFIG, 0x03)
+    bus.write_byte_data(MPU_ADDR, REG_SMPLRT_DIV, 4)
+    bus.write_byte_data(MPU_ADDR, REG_GYRO_CONFIG, 0x18)
+    bus.write_byte_data(MPU_ADDR, REG_ACCEL_CONFIG, 0x18)
+    time.sleep(0.1)
 
-def read_mpu_units(bus, gyro_offset):
-    try:
-        d = bus.read_i2c_block_data(MPU_ADDR, 0x3B, 14)
-        ax = to_int16(d[0], d[1]) / ACC_LSB_PER_G
-        ay = to_int16(d[2], d[3]) / ACC_LSB_PER_G
-        az = to_int16(d[4], d[5]) / ACC_LSB_PER_G
-        gx = (to_int16(d[8], d[9]) / GYRO_LSB_PER_DPS) - gyro_offset[0]
-        gy = (to_int16(d[10], d[11]) / GYRO_LSB_PER_DPS) - gyro_offset[1]
-        gz = (to_int16(d[12], d[13]) / GYRO_LSB_PER_DPS) - gyro_offset[2]
-        return ax, ay, az, gx, gy, gz
-    except OSError:
-        return None
 
-def calibrar_giroscopio(bus, muestras=300):
-    print("[INFO] Calibrando giroscopio. Mantén el dispositivo inmóvil...")
-    g_vals = []
-    for _ in range(muestras):
-        d = read_mpu_units(bus, [0.0, 0.0, 0.0])
-        if d: g_vals.append(d[3:6])
+def leer_raw(bus):
+    d = bus.read_i2c_block_data(MPU_ADDR, REG_ACCEL_XOUT_H, 14)
+    return (
+        int16(d[0], d[1]), int16(d[2], d[3]), int16(d[4], d[5]),
+        int16(d[8], d[9]), int16(d[10], d[11]), int16(d[12], d[13])
+    )
+
+
+def corregir_ejes(ax, ay, az, gx, gy, gz):
+    return ax, ay, az, gx, gy, gz
+
+
+def calibrar_gyro(bus, n=300):
+    print("[INFO] Calibrando giroscopio. Deja el sensor quieto...")
+    vals = []
+
+    for _ in range(n):
+        _, _, _, gx, gy, gz = leer_raw(bus)
+        vals.append([gx / GYRO_LSB_PER_DPS, gy / GYRO_LSB_PER_DPS, gz / GYRO_LSB_PER_DPS])
         time.sleep(1.0 / FS)
-    if not g_vals:
-        print("[WARN] Calibración fallida. Usando offset cero por defecto.")
-        return np.array([0.0, 0.0, 0.0])
-    offset = np.mean(g_vals, axis=0)
-    print(f"[INFO] Calibración completada. Offsets: gx={offset[0]:.2f}, gy={offset[1]:.2f}, gz={offset[2]:.2f}")
-    return offset
+
+    off = np.mean(vals, axis=0)
+    print(f"[INFO] Offset gyro: {off[0]:.2f}, {off[1]:.2f}, {off[2]:.2f} °/s")
+    return off
+
+
+def leer_mpu(bus, off):
+    ax, ay, az, gx, gy, gz = leer_raw(bus)
+
+    ax /= ACC_LSB_PER_G
+    ay /= ACC_LSB_PER_G
+    az /= ACC_LSB_PER_G
+
+    gx = gx / GYRO_LSB_PER_DPS - off[0]
+    gy = gy / GYRO_LSB_PER_DPS - off[1]
+    gz = gz / GYRO_LSB_PER_DPS - off[2]
+
+    return corregir_ejes(ax, ay, az, gx, gy, gz)
+
 
 def extraer_caracteristicas(ventana):
-    d = np.array(ventana, dtype=float)
+    x = np.asarray(ventana, dtype=float)
+    acc_mag = np.linalg.norm(x[:, 0:3], axis=1)
+    gyro_mag = np.linalg.norm(x[:, 3:6], axis=1)
+    x = np.column_stack([x, acc_mag, gyro_mag])
+
     feats = []
-    for i in range(d.shape[1]):
-        s = d[:, i]
-        feats.extend([np.mean(s), np.std(s), np.min(s), np.max(s), np.max(s) - np.min(s), np.mean(s ** 2)])
-    return np.array(feats).reshape(1, -1)
+    for s in x.T:
+        feats += [s.mean(), s.std(), s.min(), s.max(), s.max() - s.min(), np.sqrt(np.mean(s * s))]
+    return np.array(feats, dtype=float).reshape(1, -1)
+
+
+def sensor_quieto(ventana):
+    x = np.asarray(ventana, dtype=float)
+    acc_mag = np.linalg.norm(x[:, 0:3], axis=1)
+    gyro_mag = np.linalg.norm(x[:, 3:6], axis=1)
+
+    return 0.85 <= acc_mag.mean() <= 1.15 and acc_mag.std() < 0.08 and gyro_mag.mean() < 8.0
+
+
+def predecir(pack, features, nombre):
+    if nombre == "mlp":
+        features = pack["scaler"].transform(features)
+    return pack["nombres_clases"][int(pack[nombre].predict(features)[0])]
+
 
 def main():
     parser = argparse.ArgumentParser()
-    # Retornamos a tus opciones originales de consola ('arbol', 'rf', 'mlp', 'todos')
-    parser.add_argument("--model", choices=["arbol", "rf", "mlp", "todos"], default="todos")
+    parser.add_argument("--model", choices=["arbol_decision", "random_forest", "mlp", "todos"], default="todos")
+    parser.add_argument("--sin-regla", action="store_true", help="Desactiva la regla de sensor quieto")
+    parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
-    try:
-        datos = joblib.load("modelos_sisfall_sentado.pkl")
-        modelos, scaler, clases = datos["modelos"], datos["scaler"], datos["nombres_clases"]
-    except FileNotFoundError:
-        print("[ERROR] No se encontró 'modelos_sisfall_sentado.pkl'. Ejecuta primero sisfall_clasificacion.py.")
-        return
+    pack = joblib.load(MODEL_FILE)
+    n = int(WINDOW_SECONDS * FS)
+    ventana = deque(maxlen=n)
 
-    ventana = deque(maxlen=int(WINDOW_SECONDS * FS))
+    print("\nInferencia SisFall con MPU6050")
+    print(f"Modelo: {args.model}")
+    print(f"Ventana: {WINDOW_SECONDS:.1f} s")
+    print(f"Archivo: {MODEL_FILE}\n")
 
     with SMBus(I2C_BUS) as bus:
         init_mpu(bus)
-        offset = calibrar_giroscopio(bus)
-        print("\n[INFO] Inferencia activa. Presiona Ctrl+C para finalizar.\n")
-        
+        off = calibrar_gyro(bus)
+
         next_sample = time.perf_counter()
-        next_predict = time.perf_counter() + WINDOW_SECONDS
+        next_pred = time.perf_counter() + WINDOW_SECONDS
 
         try:
             while True:
                 now = time.perf_counter()
-                
-                # Anti-drift: si el tiempo real se desfasa demasiado por retraso del bus, resincronizar
-                if now > next_sample + 0.5:
-                    next_sample = now
 
                 if now >= next_sample:
-                    muestra = read_mpu_units(bus, offset)
-                    if muestra: 
-                        ventana.append(muestra)
+                    muestra = leer_mpu(bus, off)
+                    ventana.append(muestra)
+
+                    if args.debug:
+                        ax, ay, az, gx, gy, gz = muestra
+                        acc = (ax * ax + ay * ay + az * az) ** 0.5
+                        gyro = (gx * gx + gy * gy + gz * gz) ** 0.5
+                        print(f"|acc|={acc:.3f} g |gyro|={gyro:.2f} °/s", end="\r")
+
                     next_sample += 1.0 / FS
 
-                if len(ventana) == ventana.maxlen and now >= next_predict:
-                    # Extracción y escalado robusto
-                    f_sc = scaler.transform(extraer_caracteristicas(ventana))
-                    
-                    if args.model == "todos":
-                        p_arb = clases[int(modelos["arbol"].predict(f_sc)[0])]
-                        p_rf = clases[int(modelos["rf"].predict(f_sc)[0])]
-                        p_mlp = clases[int(modelos["mlp"].predict(f_sc)[0])]
-                        print(f"Árbol: {p_arb:22} | RF: {p_rf:22} | MLP: {p_mlp}")
+                if len(ventana) == n and now >= next_pred:
+                    if not args.sin_regla and sensor_quieto(ventana):
+                        if args.model == "todos":
+                            print("Árbol: Sentado quieto | RF: Sentado quieto | MLP: Sentado quieto")
+                        else:
+                            print("Predicción: Sentado quieto")
                     else:
-                        pred = clases[int(modelos[args.model].predict(f_sc)[0])]
-                        print(f"Predicción ({args.model}): {pred}")
-                    
-                    next_predict = now + PREDICT_EVERY_SECONDS
-                time.sleep(0.0005)
-        except KeyboardInterrupt:
-            print("\n[INFO] Ejecución interrumpida por el usuario. Saliendo de forma limpia.")
+                        features = extraer_caracteristicas(ventana)
 
-if __name__ == "__main__": 
+                        if features.shape[1] != pack.get("feature_count", features.shape[1]):
+                            raise ValueError("El modelo fue entrenado con otro número de características.")
+
+                        if args.model == "todos":
+                            a = predecir(pack, features, "arbol_decision")
+                            r = predecir(pack, features, "random_forest")
+                            m = predecir(pack, features, "mlp")
+                            print(f"Árbol: {a} | RF: {r} | MLP: {m}")
+                        else:
+                            print(f"Predicción: {predecir(pack, features, args.model)}")
+
+                    next_pred = now + PREDICT_EVERY_SECONDS
+
+                time.sleep(0.0005)
+
+        except KeyboardInterrupt:
+            print("\n[INFO] Programa detenido.")
+
+
+if __name__ == "__main__":
     main()
