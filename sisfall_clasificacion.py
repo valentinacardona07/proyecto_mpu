@@ -136,6 +136,85 @@ def evaluar(nombre, y_true, y_pred):
     print("Matriz de confusión:")
     print(confusion_matrix(y_true, y_pred, labels=[0, 1, 2, 3]))
 
+def graficar_imagenes(modelos, X_test, X_test_sc, y_test):
+    import matplotlib
+    matplotlib.use("Agg")
+
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from matplotlib.patches import FancyBboxPatch
+    from sklearn.metrics import accuracy_score, confusion_matrix
+
+    predicciones = [
+        ("Árbol de Decisión", modelos["arbol_decision"].predict(X_test)),
+        ("Random Forest", modelos["random_forest"].predict(X_test)),
+        ("Red Neuronal MLP", modelos["mlp"].predict(X_test_sc)),
+    ]
+
+    nombres = [p[0] for p in predicciones]
+    accuracies = [accuracy_score(y_test, p[1]) * 100 for p in predicciones]
+    matrices = [confusion_matrix(y_test, p[1], labels=[0, 1, 2, 3]) for p in predicciones]
+
+    etiquetas = ["F13", "F14", "F15", "Sentado"]
+
+    # ── Imagen 1: matrices de confusión con colores tipo imagen ─────────────
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    fig.suptitle("Matrices de confusión — Clasificación F13/F14/F15/Sentado", fontsize=13)
+
+    vmax = max(cm.max() for cm in matrices)
+
+    for ax, cm, nombre in zip(axes, matrices, nombres):
+        sns.heatmap(
+            cm,
+            annot=True,
+            fmt="d",
+            cmap="Blues",
+            ax=ax,
+            vmin=0,
+            vmax=vmax,
+            cbar=True,
+            xticklabels=etiquetas,
+            yticklabels=etiquetas,
+            annot_kws={"fontsize": 10}
+        )
+        ax.set_title(nombre, fontsize=11)
+        ax.set_xlabel("Predicho")
+        ax.set_ylabel("Real")
+
+    plt.tight_layout()
+    plt.savefig("matrices_confusion.png", dpi=120, bbox_inches="tight")
+    plt.close(fig)
+
+    # ── Imagen 2: diagrama de cajas con porcentajes ──────────────────────────
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.set_title("Porcentaje de acierto por modelo")
+    ax.set_xlabel("Accuracy (%)")
+    ax.set_xlim(0, 110)
+    ax.set_ylim(-0.7, len(nombres) - 0.3)
+    ax.grid(axis="x", alpha=0.3)
+
+    for i, (nombre, acc) in enumerate(zip(nombres, accuracies)):
+        y = len(nombres) - 1 - i
+        caja = FancyBboxPatch(
+            (0, y - 0.25),
+            max(acc, 1),
+            0.5,
+            boxstyle="round,pad=0.03"
+        )
+        ax.add_patch(caja)
+        ax.text(acc + 1, y, f"{acc:.2f}%", va="center", fontsize=11)
+
+    ax.set_yticks(range(len(nombres)))
+    ax.set_yticklabels(nombres[::-1])
+
+    plt.savefig("diagrama_cajas_porcentajes.png", dpi=120, bbox_inches="tight")
+    plt.close(fig)
+
+    print("\nImágenes guardadas:")
+    print("  matrices_confusion.png")
+    print("  diagrama_cajas_porcentajes.png")
+
 
 def main():
     from sklearn.model_selection import GroupShuffleSplit
@@ -177,6 +256,11 @@ def main():
     evaluar("Árbol de decisión", y_test, modelos["arbol_decision"].predict(X_test))
     evaluar("Random Forest", y_test, modelos["random_forest"].predict(X_test))
     evaluar("MLP", y_test, modelos["mlp"].predict(X_test_sc))
+
+    try:
+        graficar_imagenes(modelos, X_test, X_test_sc, y_test)
+    except Exception as e:
+        print(f"\n[Aviso] No se pudieron generar las imágenes: {e}")
 
     joblib.dump({
         "arbol_decision": modelos["arbol_decision"],
